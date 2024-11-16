@@ -69,6 +69,7 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
+
 /**
  * Analysis rules for Delta. Currently, these rules enable schema enforcement / evolution with
  * INSERT INTO.
@@ -930,6 +931,18 @@ class DeltaAnalysis(session: SparkSession)
         // Keep the type from the query, the target schema will be updated to widen the existing
         // type to match it.
         attr
+      case (s: MapType, t: MapType) if s != t =>
+        // Handle only specific cases where the value type of the MapType is a StructType
+        // This could be revisited and expanded in the future when needs for more
+        // nested complex operations are desired vis-a-vis ALTER TABLE COLUMN operations
+        // for deep nested fields
+        (s.valueType, t.valueType) match {
+          case (structS: StructType, structT: StructType) if structS != structT =>
+            addCastsToMaps(tblName, attr, s, t, allowTypeWidening)
+          case _ =>
+            // Default for all other MapType cases
+            getCastFunction(attr, targetAttr.dataType, targetAttr.name)
+        }
       case _ =>
         getCastFunction(attr, targetAttr.dataType, targetAttr.name)
     }
@@ -1049,6 +1062,7 @@ class DeltaAnalysis(session: SparkSession)
   /**
    * Recursively casts structs in case it contains null types.
    * TODO: Support other complex types like MapType and ArrayType
+   * The case mapType that calls addCastsToMaps addresses the MapType todo
    */
   private def addCastsToStructs(
       tableName: String,
@@ -1067,6 +1081,8 @@ class DeltaAnalysis(session: SparkSession)
             val subField = Alias(GetStructField(parent, i, Option(name)), target(i).name)(
               explicitMetadata = Option(metadata))
             addCastsToStructs(tableName, subField, nested, t, allowTypeWidening)
+          // We could also handle maptype within struct here but there is restriction
+          // on deep nexted operations that may result in maxIteration error
           case o =>
             val field = parent.qualifiedName + "." + name
             val targetName = parent.qualifiedName + "." + target(i).name
@@ -1122,6 +1138,48 @@ class DeltaAnalysis(session: SparkSession)
 
   private def stripTempViewForMergeWrapper(plan: LogicalPlan): LogicalPlan = {
     DeltaViewHelper.stripTempViewForMerge(plan, conf)
+  }
+
+  /**
+   * Recursively casts maps in case it contains null types.
+   */
+  private def addCastsToMaps(
+      tableName: String,
+      parent: NamedExpression,
+      sourceMapType: MapType,
+      targetMapType: MapType,
+      allowTypeWidening: Boolean): Expression = {
+    // First get keys from the map
+    val keysExpr = MapKeys(parent)
+
+    // Create a transformation for the values
+    val transformLambdaFunc = {
+      val elementVar = NamedLambdaVariable(
+        "elementVar", sourceMapType.valueType, sourceMapType.valueContainsNull)
+      val castedValue = sourceMapType.valueType match {
+        case structType: StructType =>
+          // Handle StructType values
+          addCastsToStructs(
+            tableName,
+            elementVar,
+            structType,
+            targetMapType.valueType.asInstanceOf[StructType],
+            allowTypeWidening
+          )
+        case _ =>
+          // Not expected to get here: see addCastsToColumn
+          throw new IllegalArgumentException(
+                s"Target type must be a StructType")
+      }
+
+      LambdaFunction(castedValue, Seq(elementVar))
+    }
+
+    val transformedValues = ArrayTransform(
+      MapValues(parent), transformLambdaFunc)
+
+    // Create new map from keys and transformed values
+    MapFromArrays(keysExpr, transformedValues)
   }
 
   /**
